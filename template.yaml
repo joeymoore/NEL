@@ -1,0 +1,404 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+Description: "NEL endpoint for Imperva controlled Report-To headers"
+
+Resources:
+  NelHandlerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      InlineCode: |
+        import json
+        import boto3
+        import os
+        from botocore.exceptions import ClientError
+        def lambda_handler(event, context):
+            if event["httpMethod"] == "OPTIONS":
+                return {"statusCode": 204,
+                        "headers": {
+                            "Access-Control-Allow-Methods": "POST",
+                            "Access-Control-Allow-Origin": "*",
+                            "Access-Control-Allow-Headers": "Content-Type"
+                        }
+                        }
+            elif event["httpMethod"] == "POST":
+                enrichment = {
+                    "asn": event["queryStringParameters"]["asn"],
+                    "site": event["queryStringParameters"]["site"],
+                    "account": event["queryStringParameters"]["account"],
+                    "epoch": event["queryStringParameters"]["epoch"],
+                    "address": {
+                        "state": event["queryStringParameters"]["state"],
+                        "city": event["queryStringParameters"]["city"],
+                        "country": event["queryStringParameters"]["country"],
+                        "postalcode": event["queryStringParameters"]["postalcode"],
+                        "latitude": event["queryStringParameters"]["latitude"],
+                        "longitude": event["queryStringParameters"]["longitude"]
+                    }
+                }
+                body = json.loads(event["body"])
+
+                records = []
+                for record in body:
+                    record["enrichment"] = enrichment
+                    msg_bytes = json.dumps(record).encode('utf-8')
+                    records.append({"Data": msg_bytes,
+                                    'PartitionKey': event["queryStringParameters"]["account"]})
+
+                try:
+                    client = boto3.client('kinesis')
+                    response = client.put_records(
+                        Records=records,
+                        StreamName=os.environ['StreamName']
+                    )
+
+                    if "FailedRecordCount" in response:
+                        return {"statusCode": 201,
+                                "headers": {
+                                    "Content-Type": "application/json"
+                                },
+                                "body": "ok"
+                                }
+
+                except ClientError as e:
+                    return {"statusCode": 500,
+                            "headers": {
+                                "Content-Type": "application/json"
+                            },
+                            "body": e.response['Error']['Message']
+                            }
+
+      Handler: index.lambda_handler
+      Runtime: python3.7
+      Timeout: 60
+      Role: !GetAtt NELRole.Arn
+      Environment:
+        Variables:
+          StreamName: !Ref NELCatcher
+
+      Events:
+        NelHandler:
+          Type: Api
+          Properties:
+            Path: /
+            Method: ANY
+            RequestParameters:
+            - method.request.querystring.asn
+            - method.request.querystring.country
+            - method.request.querystring.state
+            - method.request.querystring.city
+            - method.request.querystring.site
+            - method.request.querystring.account
+            - method.request.querystring.postalcode
+            - method.request.querystring.latitude
+            - method.request.querystring.longitude
+
+  NELS3Delivery:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: NEL_S3_Delivery
+      DeliveryStreamType: KinesisStreamAsSource
+      KinesisStreamSourceConfiguration:
+        KinesisStreamARN: !GetAtt NELCatcher.Arn
+        RoleARN: !GetAtt NELRole.Arn
+      S3DestinationConfiguration:
+          BucketARN: !GetAtt NELBOX.Arn
+          BufferingHints:
+            IntervalInSeconds: 60
+            SizeInMBs: 1
+          ErrorOutputPrefix: 'NEL_ERR_SAM'
+          Prefix: 'NEL-SAM'
+          RoleARN: !GetAtt NELRole.Arn
+    DependsOn:
+      - NELCatcher
+      - NELBOX
+      - NELRole
+
+  NELCatcher:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: 'NEL_Catcher'
+      RetentionPeriodHours: 24
+      ShardCount: 5
+    DependsOn:
+      - NELRole
+
+  NELBOX:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::Region}-nelbox.impervademo.com'
+    DependsOn:
+      - NELRole
+
+
+  NELRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - firehose.amazonaws.com
+              - lambda.amazonaws.com
+              - apigateway.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: "/"
+
+  NELS3Policies:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: s3
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: 's3:*'
+            Resource: '*'
+      Roles:
+      - !Ref NELRole
+
+  NELKinesisPolicies:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: kinesis
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: 'kinesis:*'
+            Resource: '*'
+      Roles:
+      - !Ref NELRole
+
+  NELLogsPolicies:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: cloudwatch
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: 'logs:*'
+            Resource: '*'
+      Roles:
+      - !Ref NELRole
+
+  NELSecretsManagerPolicies:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: secretsmanagers
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: 'secretsmanager:*'
+            Resource: '*'
+      Roles:
+      - !Ref NELRole
+
+  IMPVAPIKEY:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: 'Storing your api_key securely.'
+      SecretString: !Ref APIKEY
+
+  IMPVNELADR:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+          import cfnresponse
+
+          import botocore.vendored.requests as requests
+          def handler(event, context):
+              print("We started the IMPVNELADR {} called.".format(event["RequestType"]))
+              client = boto3.client('secretsmanager')
+              secret_resp = client.get_secret_value(
+                  SecretId=os.environ['SECRETS_MANAGER_ARN']
+              )
+
+              authQuery = {
+                  "api_id": os.environ['APIID'],
+                  "api_key": secret_resp["SecretString"]
+              }
+
+              adrData = {
+                  "api_id": os.environ['APIID'],
+                  "api_key": secret_resp["SecretString"],
+                  "site_id": os.environ['SITEID'],
+                  "name": "NEL_Header",
+                  "action": "RULE_ACTION_RESPONSE_REWRITE_HEADER",
+                  "add_missing": "true",
+                  "to": '{"report_to": "default", "max_age": 3600, "include_subdomains": true,"success_fraction": 0.01, "failure_fraction": 1.0}',
+                  "rewrite_name": "NEL"
+              }
+
+              try:
+
+                  url = "https://my.incapsula.com/api/prov/v1/sites/incapRules/list?site_id={}&page_size=100".format(os.environ['SITEID'])
+                  r = requests.post(url, data=authQuery)
+
+                  rule_id = get_rule(r, "NEL_Header")
+
+                  if event["RequestType"] in ["Create", "Update"]:
+                      if rule_id:
+                          url = "https://my.incapsula.com/api/prov/v1/sites/incapRules/edit"
+                          r = requests.post(url, data=adrData)
+                          cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                          return
+                      else:
+                          url = "https://my.incapsula.com/api/prov/v1/sites/incapRules/add"
+                          r = requests.post(url, data=adrData)
+                          cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                          return
+                  elif event["RequestType"] == "Delete":
+                      url = "https://my.incapsula.com/api/prov/v1/sites/incapRules/delete?rule_id={}".format(rule_id)
+                      r = requests.post(url, data=authQuery)
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  raise Exception
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception:
+                  print('Signaling failure to CloudFormation.')
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+          def get_rule(data, rule_filter=None):
+              print("Find this Rule: {}".format(rule_filter))
+              print("Look in here: {}".format(data.json()))
+              if "delivery_rules" in data.json():
+                  for k, v in data.json()["delivery_rules"].items():
+                      for rule in v:
+                          print(rule)
+                          if rule_filter == rule["name"]:
+                              return rule["id"]
+
+      Handler: index.handler
+      Role: !GetAtt NELRole.Arn
+      Runtime: python3.7
+      Timeout: 60
+      Environment:
+        Variables:
+          SECRETS_MANAGER_ARN: !Ref IMPVAPIKEY
+          NEL_ENDPOINT_API: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Stage"
+          SITEID: !Ref SITEID
+          ACCOUNTID: !Ref ACCOUNTID
+          APIID: !Ref APIID
+
+  CWAFNEL:
+    Type: Custom::NelHeader
+    Properties:
+      ServiceToken: !GetAtt IMPVNELADR.Arn
+
+  IMPVReportADR:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+          import cfnresponse
+          import botocore.vendored.requests as requests
+          def handler(event, context):
+              print("We started the IMPVREPORTADR {} called.".format(event["RequestType"]))
+              client = boto3.client('secretsmanager')
+              secret_resp = client.get_secret_value(
+                  SecretId=os.environ['SECRETS_MANAGER_ARN']
+              )
+
+              authQuery = {
+                  "api_id": os.environ['APIID'],
+                  "api_key": secret_resp["SecretString"]
+              }
+
+              adrData = {
+                  "api_id": os.environ['APIID'],
+                  "api_key": secret_resp["SecretString"],
+                  "site_id": os.environ['SITEID'],
+                  "name": "Report_To_NEL_Header",
+                  "action": "RULE_ACTION_RESPONSE_REWRITE_HEADER",
+                  "add_missing": "true",
+                  "to": os.environ['NEL_ENDPOINT_API'],
+                  "rewrite_name": "Report-To"
+              }
+              try:
+
+                  url = "https://my.incapsula.com/api/prov/v1/sites/incapRules/list?site_id={}&page_size=100".format(os.environ['SITEID'])
+                  r = requests.post(url, data=authQuery)
+                  rule_id = get_rule(r, "Report_To_NEL_Header")
+
+                  if event["RequestType"] in ["Create", "Update"]:
+                      if rule_id:
+                          url = "https://my.incapsula.com/api/prov/v1/sites/incapRules/edit?rule_id={}".format(rule_id)
+                          r = requests.post(url, data=adrData)
+                          cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                          return
+                      else:
+                          url = "https://my.incapsula.com/api/prov/v1/sites/incapRules/add"
+                          r = requests.post(url, data=adrData)
+                          cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                          return
+                  elif event["RequestType"] == "Delete":
+                      url = "https://my.incapsula.com/api/prov/v1/sites/incapRules/delete?rule_id={}".format(rule_id)
+                      r = requests.post(url, data=authQuery)
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  raise Exception
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception:
+                  print('Signaling failure to CloudFormation.')
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+          def get_rule(data, rule_filter=None):
+              if "delivery_rules" in data.json():
+                  for k, v in data.json()["delivery_rules"].items():
+                      for rule in v:
+                          if rule_filter == rule["name"]:
+                              return rule["id"]
+
+      Handler: index.handler
+      Role: !GetAtt NELRole.Arn
+      Runtime: python3.7
+      Timeout: 60
+      Environment:
+        Variables:
+          NEL_ENDPOINT_API: !Sub '{"group":"default","max_age": 3600,"endpoints":[{"url": "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Stage?asn=$asn&account=${ACCOUNTID}&city=$city&country=$country&postalcode=$postalcode&site=${SITEID}&state=$state&epoch=$epoch&longitude=$longitude&latitude=$latitude"}],"include_subdomains":true}'
+          SECRETS_MANAGER_ARN: !Ref IMPVAPIKEY
+          SITEID: !Ref SITEID
+          ACCOUNTID: !Ref ACCOUNTID
+          APIID: !Ref APIID
+
+
+  CWAFReport:
+    Type: Custom::NelReport
+    Properties:
+      ServiceToken: !GetAtt IMPVReportADR.Arn
+
+Parameters:
+  APIID:
+    Description: Provide your Imperva CWAF API ID.
+    Type: String
+  APIKEY:
+    Description: Provide your Imperva CWAF API KEY.
+    Type: String
+    NoEcho: true
+  SITEID:
+    Description: Provide your Imperva CWAF Site ID.
+    Type: Number
+  ACCOUNTID:
+    Description: Provide your Imperva CWAF Account ID.
+    Type: Number
+
+Outputs:
+  NelHandlerApi:
+    Description: "API Gateway endpoint URL for Dev stage for NEL Handler function"
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Stage"
+  NelHandlerFunction:
+    Description: "NEL Handler Lambda Function ARN"
+    Value: !GetAtt NelHandlerFunction.Arn
+  NelApiEndpoint:
+    Description: "API Gateway endpoint URL for Dev stage for NEL Handler function"
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Stage?asn=$asn&account=${ACCOUNTID}&city=$city&country=$country&postalcode=$postalcode&site=${SITEID}&state=$state&epoch=$epoch&longitude=$longitude&latitude=$latitude"
